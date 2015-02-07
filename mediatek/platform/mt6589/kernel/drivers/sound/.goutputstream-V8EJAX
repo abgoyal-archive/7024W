@@ -1,0 +1,968 @@
+
+
+
+
+
+#define CONFIG_MTK_DEEP_IDLE
+#ifdef CONFIG_MTK_DEEP_IDLE
+#include <mach/mt_clkmgr.h>
+#include <mach/mt_idle.h>
+#endif
+
+#include "AudDrv_Common.h"
+#include "AudDrv_Def.h"
+#include "AudDrv_Afe.h"
+#include "AudDrv_Ana.h"
+#include "AudDrv_Clk.h"
+#include "AudDrv_ioctl.h"
+#include "AudDrv_Kernel.h"
+
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/device.h>
+#include <linux/slab.h>
+#include <linux/fs.h>
+#include <linux/completion.h>
+#include <linux/mm.h>
+#include <linux/delay.h>
+#include <linux/interrupt.h>
+#include <linux/dma-mapping.h>
+#include <linux/vmalloc.h>
+#include <linux/platform_device.h>
+#include <linux/miscdevice.h>
+#include <linux/wait.h>
+#include <linux/spinlock.h>
+#include <linux/sched.h>
+#include <linux/wakelock.h>
+#include <linux/semaphore.h>
+#include <linux/jiffies.h>
+#include <linux/proc_fs.h>
+#include <linux/string.h>
+#include <linux/mutex.h>
+#include <linux/xlog.h>
+#include <mach/irqs.h>
+#include <asm/uaccess.h>
+#include <asm/irq.h>
+#include <asm/io.h>
+#include <mach/mt_reg_base.h>
+#include <asm/div64.h>
+#include <linux/aee.h>
+#include <mach/pmic_mt6320_sw.h>
+#include <mach/upmu_common.h>
+#include <mach/upmu_hw.h>
+
+#include <mach/mt_gpio.h>
+#include <mach/mt_typedefs.h>
+
+
+
+#include "yusu_android_speaker.h"
+#if defined(CONFIG_MTK_COMBO) || defined(CONFIG_MTK_COMBO_MODULE)
+#include <mach/mt_combo.h>
+#endif
+
+#if defined(MTK_MT5192) || defined(MTK_MT5193)
+extern int cust_matv_gpio_on(void);
+extern int cust_matv_gpio_off(void);
+#endif
+
+#define GPIO_WR32(addr, data)   __raw_writel(data, addr)
+#define GPIO_RD32(addr)         __raw_readl(addr)
+
+#ifdef JRD_IPHONE_HDST_COMPATIBILITY //Added by jrd.lipeng for iphone headset compatibility.
+void jrd_trigger_iphone_hdst(void);
+#endif
+
+#define AUDDRV_NAME   "MediaTek Audio Driver"
+#define AUDDRV_AUTHOR "MediaTek WCX"
+
+#define AUDDRV_DL1_MAX_BUFFER_LENGTH (0x4000)
+#define MT6583_AFE_MCU_IRQ_LINE (104 + 32)
+#define MASK_ALL		  (0xFFFFFFFF)
+
+#define AFE_INT_TIMEOUT       (10)
+#define AFE_UL_TIMEOUT       (10)
+
+#ifdef MTK_3MIC_SUPPORT
+// add for 3 mic switch enable , GPIO is not fixed
+#define  GPIO_MIC_ANALOGSWITCH_EN (116)
+#endif
+
+
+static char       auddrv_name[]       = "AudDrv_driver_device";
+static u64        AudDrv_dmamask      = 0xffffffffUL;
+
+static bool   AudDrvSuspendStatus            = false; // is suspend flag
+static bool   AudIrqReset                              = false; // flag when irq to reset
+static bool   AuddrvSpkStatus                     = false;
+static bool   AuddrvAeeEnable                    = false;
+static volatile kal_uint8	 Afe_irq_status  = 0;
+
+#define WriteArrayMax (6)
+#define WriteWarningTrigger (3)
+static int WriteArrayIndex = 0;
+static unsigned int WriteRecordArray[WriteArrayMax] = {0};
+
+static DEFINE_SPINLOCK(auddrv_lock);
+static DEFINE_SPINLOCK(auddrv_irqstatus_lock);
+static DEFINE_SPINLOCK(auddrv_SphCtlState_lock);
+static DEFINE_SPINLOCK(auddrv_DLCtl_lock);
+static DEFINE_SPINLOCK(auddrv_ULInCtl_lock);
+
+// hold for not let system go into suspend mode
+struct wake_lock  Audio_wake_lock;
+struct wake_lock  Audio_record_wake_lock;
+
+// wait queue flag
+static kal_uint32 DL1_wait_queue_flag  = 0;
+DECLARE_WAIT_QUEUE_HEAD(DL1_Wait_Queue);
+static kal_uint32 DL1_Interrupt_Interval =0;
+static kal_uint32 DL1_Interrupt_Interval_Limit =0;
+
+// wait queue flag
+static kal_uint32 DL2_wait_queue_flag  = 0;
+DECLARE_WAIT_QUEUE_HEAD(DL2_Wait_Queue);
+
+//VUL quene
+static kal_uint32 VUL_wait_queue_flag  = 0;
+DECLARE_WAIT_QUEUE_HEAD(VUL_Wait_Queue);
+
+//AWB quene
+static kal_uint32 AWB_wait_queue_flag  = 0;
+DECLARE_WAIT_QUEUE_HEAD(AWB_Wait_Queue);
+
+//AWB quene
+static kal_uint32 DAI_wait_queue_flag  = 0;
+DECLARE_WAIT_QUEUE_HEAD(DAI_Wait_Queue);
+
+//AWB quene
+static kal_uint32 MODDAI_wait_queue_flag  = 0;
+DECLARE_WAIT_QUEUE_HEAD(MODDAI_Wait_Queue);
+
+// amp mutex lock
+static DEFINE_MUTEX(gamp_mutex);
+static DEFINE_MUTEX(AnaClk_mutex);
+
+
+void CheckPowerState(void);
+bool GetHeadPhoneState(void);
+void Auddrv_Check_Irq(void);
+static void CheckInterruptTiming(void);
+static void ClearInterruptTiming(void);
+
+//here is counter of clock , user extern , clock counter is maintain in auddrv_clk
+
+extern int        Aud_Core_Clk_cntr ;
+extern int        Aud_AFE_Clk_cntr   ;
+extern int        Aud_ADC_Clk_cntr  ;
+extern int        Aud_I2S_Clk_cntr    ;
+extern int        Aud_ANA_Clk_cntr  ;
+extern int        Aud_LineIn_Clk_cntr;
+extern int        Aud_HDMI_Clk_cntr;
+extern int        Afe_Mem_Pwr_on;
+extern int        Aud_AFE_Clk_cntr;
+
+static bool CheckNullPointer(void* pointer)
+{
+    if(pointer == NULL){
+        printk("CheckNullPointer pointer = NULL");
+        return true;
+    }
+    return false;
+}
+
+static bool CheckSize(uint32 size)
+{
+    if((size) == 0){
+        printk("CheckSize size = 0");
+        return true;
+    }
+    return false;
+}
+
+static kal_uint32 AudDrv_SampleRateIndexConvert(kal_uint32 SampleRateIndex)
+{
+    switch(SampleRateIndex)
+    {
+        case 0x0:
+            return 8000;
+        case 0x1:
+            return 11025;
+        case 0x2:
+            return 12000;
+        case 0x4:
+            return 16000;
+        case 0x5:
+            return 22050;
+        case 0x6:
+            return 24000;
+        case 0x8:
+            return 32000;
+        case 0x9:
+            return 44100;
+        case 0xa:
+            return 48000;
+        default:
+        printk("AudDrv_SampleRateIndexConvert SampleRateIndex = %d\n",SampleRateIndex);
+            return 44100;
+    }
+    return 0;
+}
+
+static void AudDrv_getDLInterval(void)
+{
+    kal_uint32 samplerate = Afe_Get_Reg(AFE_IRQ_MCU_CON);
+    kal_uint32 InterruptSample = Afe_Get_Reg(AFE_IRQ_CNT1);
+    samplerate =(samplerate>>4)&0x0000000f;
+    samplerate = AudDrv_SampleRateIndexConvert(samplerate);
+    DL1_Interrupt_Interval = ((InterruptSample*1000)/samplerate) +1;
+    DL1_Interrupt_Interval_Limit= DL1_Interrupt_Interval*11/8;
+    //PRINTK_AUDDRV("DL1_Interrupt_Interval = %d DL1_Interrupt_Interval_Limit = %d\n",DL1_Interrupt_Interval,DL1_Interrupt_Interval_Limit);
+}
+
+static void power_init(void)
+{
+    uint32_t chip_version = upmu_get_cid();
+    upmu_set_rg_clksq_en(0);
+    if(chip_version >= PMIC6320_E2_CID_CODE)
+    {
+        Ana_Set_Reg(AUDLDO_CFG0,0x0192 ,0xffffffff);
+        Ana_Set_Reg(AUDNVREGGLB_CFG0,0x0006,0xffffffff);
+        Ana_Set_Reg(AUD_NCP0,0x8000,0xffffffff);
+    }
+    else
+    {
+        Ana_Set_Reg(AUDLDO_CFG0,0x0992 ,0xffffffff);
+        Ana_Set_Reg(AUDNVREGGLB_CFG0,0x0004,0xffffffff);
+        Ana_Set_Reg(AUD_NCP0,0x9000,0xffffffff);
+    }
+}
+
+bool GetHeadPhoneState(void)
+{
+    uint32 HPAna_reg =0;
+    if(Aud_ANA_Clk_cntr == true)
+    {
+        HPAna_reg = Ana_Get_Reg(AUDBUF_CFG0);
+        if(HPAna_reg & 0x6)
+            return true;
+    }
+    return false;
+}
+
+void AudioWayEnable(void)
+{
+    volatile uint32 address = 0xF0001200;
+    volatile uint32 *AudioWayEnable = (volatile uint32*)address;
+    volatile uint32 value = 0xF0001200;
+    value = (*AudioWayEnable);
+    value =(value&0xffffff7f);
+    //PRINTK_AUDDRV("AudioWayEnable value = %x\n",value);
+    mt65xx_reg_sync_writel(value,AudioWayEnable);
+}
+
+void AudioWayDisable(void)
+{
+    volatile uint32 address = 0xF0001200;
+    volatile uint32 *AudioWayEnable = (volatile uint32*)address;
+    volatile uint32 value = 0xF0001200;
+    value = (*AudioWayEnable);
+    value |= 0x80;
+    //PRINTK_AUDDRV("AudioWayDisable value = %x\n",value);
+    mt65xx_reg_sync_writel(value,AudioWayEnable);
+}
+
+void SaveWriteWaitEvent(unsigned int  t2)
+{
+    WriteRecordArray[WriteArrayIndex] = t2; // in ms
+    WriteArrayIndex++;
+    if(WriteArrayIndex >=WriteArrayMax )
+        WriteArrayIndex-=WriteArrayMax;
+}
+
+void ResetWriteWaitEvent(void)
+{
+    int i=0;
+    for(i=0;i<WriteArrayMax ; i++)
+    {
+        WriteRecordArray[i] = 0;
+    }
+    // also reset hardware
+    WriteArrayIndex =0;
+}
+
+void CheckWriteWaitEvent(void)
+{
+    int i=0;
+    int OverTimeCounter =0;
+    unsigned int DL1_Interrupt_Interval_ns = DL1_Interrupt_Interval_Limit *1000000;
+    for(i=0;i<WriteArrayMax ; i++)
+    {
+        //printk("WriteRecordArray[%d] = %d ",i ,WriteRrecordArray[i]);
+        if(WriteRecordArray[i] > DL1_Interrupt_Interval_ns)
+        {
+            OverTimeCounter++;
+        }
+    }
+    //printk("DL1_Interrupt_Interval_Limit = %d DL1_Interrupt_Interval_ns = %d\n",DL1_Interrupt_Interval_Limit,DL1_Interrupt_Interval_ns);
+
+    if(OverTimeCounter >= WriteWarningTrigger)
+    {
+        xlog_printk(ANDROID_LOG_ERROR, "Sound","Audio Dump FTrace, OverTimeCounter=%d n",OverTimeCounter);
+        if(AuddrvAeeEnable)
+        {
+            aee_kernel_exception_api(__FILE__, __LINE__, DB_OPT_FTRACE, "Audio is blocked", "audio blocked dump ftrace");
+        }
+        ResetWriteWaitEvent();
+        //AudIrqReset = true;
+    }
+}
+
+
+
+static int AudDrv_Read_Procmem(char *buf,char **start, off_t offset, int count , int *eof, void *data)
+{
+    int len =0;
+    PRINTK_AUDDRV("+AudDrv_Read_Procmem \n");
+    AudDrv_Clk_On();
+
+    len += sprintf(buf+len ,"Afe_Mem_Pwr_on =0x%x\n",Afe_Mem_Pwr_on);
+    len += sprintf(buf+len ,"Aud_AFE_Clk_cntr = 0x%x\n",Aud_AFE_Clk_cntr);
+    len += sprintf(buf+len ,"Aud_ANA_Clk_cntr = 0x%x\n",Aud_ANA_Clk_cntr);
+    len += sprintf(buf+len ,"Aud_HDMI_Clk_cntr = 0x%x\n",Aud_HDMI_Clk_cntr);
+    len += sprintf(buf+len ,"Aud_I2S_Clk_cntr = 0x%x\n",Aud_I2S_Clk_cntr);
+    len += sprintf(buf+len ,"AuddrvSpkStatus = 0x%x\n",AuddrvSpkStatus);
+
+    len += sprintf(buf+len ,"AFE_TOP_CON0 = 0x%x\n",Afe_Get_Reg(AUDIO_AFE_TOP_CON0));
+    len += sprintf(buf+len ,"AFE_TOP_CON3 = 0x%x\n",Afe_Get_Reg(AUDIO_AFE_TOP_CON3));
+    len += sprintf(buf+len ,"DAC_CON0 = 0x%x\n",Afe_Get_Reg(AFE_DAC_CON0));
+    len += sprintf(buf+len ,"DAC_CON1 = 0x%x\n",Afe_Get_Reg(AFE_DAC_CON1));
+    len += sprintf(buf+len ,"I2S_CON = 0x%x\n",Afe_Get_Reg(AFE_I2S_CON));
+    len += sprintf(buf+len ,"DAIBT_CON0 = 0x%x\n",Afe_Get_Reg(AFE_DAIBT_CON0));
+    len += sprintf(buf+len ,"CONN0 = 0x%x\n",Afe_Get_Reg(AFE_CONN0));
+    len += sprintf(buf+len ,"CONN1 = 0x%x\n",Afe_Get_Reg(AFE_CONN1));
+    len += sprintf(buf+len ,"CONN2 = 0x%x\n",Afe_Get_Reg(AFE_CONN2));
+    len += sprintf(buf+len ,"CONN3 = 0x%x\n",Afe_Get_Reg(AFE_CONN3));
+    len += sprintf(buf+len ,"CONN4 = 0x%x\n",Afe_Get_Reg(AFE_CONN4));
+    len += sprintf(buf+len ,"I2S_CON1 = 0x%x\n",Afe_Get_Reg(AFE_I2S_CON1));
+    len += sprintf(buf+len ,"I2S_CON2 = 0x%x\n",Afe_Get_Reg(AFE_I2S_CON2));
+
+    len += sprintf(buf+len ,"MRGIF_CON = 0x%x\n",Afe_Get_Reg(AFE_MRGIF_CON));
+    len += sprintf(buf+len ,"DL1_BASE = 0x%x\n",Afe_Get_Reg(AFE_DL1_BASE));
+    len += sprintf(buf+len ,"DL1_CUR = 0x%x\n",Afe_Get_Reg(AFE_DL1_CUR));
+    len += sprintf(buf+len ,"DL1_END = 0x%x\n",Afe_Get_Reg(AFE_DL1_END));
+    len += sprintf(buf+len ,"AWB_BASE = 0x%x\n",Afe_Get_Reg(AFE_AWB_BASE));
+    len += sprintf(buf+len ,"AWB_END = 0x%x\n",Afe_Get_Reg(AFE_AWB_END));
+    len += sprintf(buf+len ,"AWB_CUR = 0x%x\n",Afe_Get_Reg(AFE_AWB_CUR));
+    len += sprintf(buf+len ,"VUL_BASE = 0x%x\n",Afe_Get_Reg(AFE_VUL_BASE));
+    len += sprintf(buf+len ,"VUL_END = 0x%x\n",Afe_Get_Reg(AFE_VUL_END));
+    len += sprintf(buf+len ,"VUL_CUR = 0x%x\n",Afe_Get_Reg(AFE_VUL_CUR));
+    len += sprintf(buf+len ,"DAI_BASE = 0x%x\n",Afe_Get_Reg(AFE_DAI_BASE));
+    len += sprintf(buf+len ,"DAI_END = 0x%x\n",Afe_Get_Reg(AFE_DAI_END));
+    len += sprintf(buf+len ,"DAI_CUR = 0x%x\n",Afe_Get_Reg(AFE_DAI_CUR));
+    len += sprintf(buf+len ,"IRQ_CON = 0x%x\n",Afe_Get_Reg(AFE_IRQ_CON));
+
+    len += sprintf(buf+len ,"MEMIF_MON0 = 0x%x\n",Afe_Get_Reg(AFE_MEMIF_MON0));
+    len += sprintf(buf+len ,"MEMIF_MON1 = 0x%x\n",Afe_Get_Reg(AFE_MEMIF_MON1));
+    len += sprintf(buf+len ,"MEMIF_MON2 = 0x%x\n",Afe_Get_Reg(AFE_MEMIF_MON2));
+    len += sprintf(buf+len ,"MEMIF_MON3 = 0x%x\n",Afe_Get_Reg(AFE_MEMIF_MON3));
+    len += sprintf(buf+len ,"MEMIF_MON4 = 0x%x\n",Afe_Get_Reg(AFE_MEMIF_MON4));
+
+    len += sprintf(buf+len ,"SIDETONE_DEBUG = 0x%x\n",Afe_Get_Reg(AFE_SIDETONE_DEBUG));
+    len += sprintf(buf+len ,"SIDETONE_MON = 0x%x\n",Afe_Get_Reg(AFE_SIDETONE_MON));
+    len += sprintf(buf+len ,"SIDETONE_CON0 = 0x%x\n",Afe_Get_Reg(AFE_SIDETONE_CON0));
+    len += sprintf(buf+len ,"SIDETONE_COEFF = 0x%x\n",Afe_Get_Reg(AFE_SIDETONE_COEFF));
+    len += sprintf(buf+len ,"SIDETONE_CON1 = 0x%x\n",Afe_Get_Reg(AFE_SIDETONE_CON1));
+    len += sprintf(buf+len ,"SIDETONE_GAIN = 0x%x\n",Afe_Get_Reg(AFE_SIDETONE_GAIN));
+    len += sprintf(buf+len ,"SGEN_CON0 = 0x%x\n",Afe_Get_Reg(AFE_SGEN_CON0));
+
+    len += sprintf(buf+len ,"MRG_MON0 = 0x%x\n",Afe_Get_Reg(AFE_MRG_MON0));
+    len += sprintf(buf+len ,"MRG_MON1 = 0x%x\n",Afe_Get_Reg(AFE_MRG_MON1));
+    len += sprintf(buf+len ,"MRG_MON2 = 0x%x\n",Afe_Get_Reg(AFE_MRG_MON2));
+    len += sprintf(buf+len ,"TOP_CON0 = 0x%x\n",Afe_Get_Reg(AFE_TOP_CON0));
+
+    len += sprintf(buf+len ,"IRQ_MCU_CON = 0x%x\n",Afe_Get_Reg(AFE_IRQ_MCU_CON)); //ccc
+    len += sprintf(buf+len ,"IRQ_STATUS = 0x%x\n",Afe_Get_Reg(AFE_IRQ_STATUS));
+    len += sprintf(buf+len ,"IRQ_CLR = 0x%x\n",Afe_Get_Reg(AFE_IRQ_CLR));
+    len += sprintf(buf+len ,"IRQ_CNT1 = 0x%x\n",Afe_Get_Reg(AFE_IRQ_CNT1));
+    len += sprintf(buf+len ,"IRQ_CNT2 = 0x%x\n",Afe_Get_Reg(AFE_IRQ_CNT2));
+    len += sprintf(buf+len ,"IRQ_MON2 = 0x%x\n",Afe_Get_Reg(AFE_IRQ_MON2));
+    len += sprintf(buf+len ,"IRQ_CNT5 = 0x%x\n",Afe_Get_Reg(AFE_IRQ_CNT5));
+    len += sprintf(buf+len ,"IRQ1_CNT_MON = 0x%x\n",Afe_Get_Reg(AFE_IRQ1_CNT_MON));
+    len += sprintf(buf+len ,"IRQ2_CNT_MON = 0x%x\n",Afe_Get_Reg(AFE_IRQ2_CNT_MON));
+    len += sprintf(buf+len ,"IRQ1_EN_CNT_MON = 0x%x\n",Afe_Get_Reg(AFE_IRQ1_EN_CNT_MON));
+    len += sprintf(buf+len ,"IRQ5_MCU_EN_CNT_MON = 0x%x\n",Afe_Get_Reg(AFE_IRQ5_MCU_EN_CNT_MON));
+
+    len += sprintf(buf+len ,"MEMIF_MINLEN  = 0x%x\n",Afe_Get_Reg(AFE_MEMIF_MINLEN));
+    len += sprintf(buf+len ,"MEMIF_MAXLEN  = 0x%x\n",Afe_Get_Reg(AFE_MEMIF_MAXLEN));
+    len += sprintf(buf+len ,"IEC_PREFETCH_SIZE  = 0x%x\n",Afe_Get_Reg(AFE_IEC_PREFETCH_SIZE));
+
+    len += sprintf(buf+len ,"GAIN2_CON0 = 0x%x\n",Afe_Get_Reg(AFE_GAIN2_CON0));
+    len += sprintf(buf+len ,"GAIN2_CON1 = 0x%x\n",Afe_Get_Reg(AFE_GAIN2_CON1));
+    len += sprintf(buf+len ,"GAIN2_CON2 = 0x%x\n",Afe_Get_Reg(AFE_GAIN2_CON2));
+    len += sprintf(buf+len ,"GAIN2_CON3 = 0x%x\n",Afe_Get_Reg(AFE_GAIN2_CON3));
+    len += sprintf(buf+len ,"GAIN2_CONN = 0x%x\n",Afe_Get_Reg(AFE_GAIN2_CONN));
+    len += sprintf(buf+len ,"GAIN2_CONN2 = 0x%x\n",Afe_Get_Reg(AFE_GAIN2_CONN2));
+    len += sprintf(buf+len ,"GAIN2_CUR = 0x%x\n",Afe_Get_Reg(AFE_GAIN2_CUR));
+
+    len += sprintf(buf+len ,"PCM_INTF_CON1 = 0x%x\n",Afe_Get_Reg(PCM_INTF_CON1));
+    len += sprintf(buf+len ,"PCM_INTF_CON2 = 0x%x\n",Afe_Get_Reg(PCM_INTF_CON2));
+    len += sprintf(buf+len ,"PCM2_INTF_CON = 0x%x\n",Afe_Get_Reg(PCM2_INTF_CON));
+
+    len += sprintf(buf+len ,"UL_DL_CON0 = 0x%x\n",Ana_Get_Reg(AFE_UL_DL_CON0));
+    len += sprintf(buf+len ,"DL_SRC2_CON0_H = 0x%x\n",Ana_Get_Reg(AFE_DL_SRC2_CON0_H));
+    len += sprintf(buf+len ,"DL_SRC2_CON0_L = 0x%x\n",Ana_Get_Reg(AFE_DL_SRC2_CON0_L));
+    len += sprintf(buf+len ,"DL_SRC2_CON1_H = 0x%x\n",Ana_Get_Reg(AFE_DL_SRC2_CON1_H));
+    len += sprintf(buf+len ,"DL_SRC2_CON1_L = 0x%x\n",Ana_Get_Reg(AFE_DL_SRC2_CON1_L));
+    len += sprintf(buf+len ,"DL_SDM_CON0 = 0x%x\n",Ana_Get_Reg(AFE_DL_SDM_CON0));
+    len += sprintf(buf+len ,"DL_SDM_CON1 = 0x%x\n",Ana_Get_Reg(AFE_DL_SDM_CON1));
+    len += sprintf(buf+len ,"UL_SRC_CON0_H = 0x%x\n",Ana_Get_Reg(AFE_UL_SRC_CON0_H));
+    len += sprintf(buf+len ,"UL_SRC_CON0_L = 0x%x\n",Ana_Get_Reg(AFE_UL_SRC_CON0_L));
+    len += sprintf(buf+len ,"UL_SRC_CON1_H = 0x%x\n",Ana_Get_Reg(AFE_UL_SRC_CON1_H));
+    len += sprintf(buf+len ,"UL_SRC_CON1_L = 0x%x\n",Ana_Get_Reg(AFE_UL_SRC_CON1_L));
+
+    len += sprintf(buf+len ,"AFE_I2S_CON1 = 0x%x\n",Ana_Get_Reg(ANA_AFE_I2S_CON1));
+    len += sprintf(buf+len ,"I2S_FIFO_UL_CFG0 = 0x%x\n",Ana_Get_Reg(AFE_I2S_FIFO_UL_CFG0));
+    len += sprintf(buf+len ,"I2S_FIFO_DL_CFG0 = 0x%x\n",Ana_Get_Reg(AFE_I2S_FIFO_DL_CFG0));
+    len += sprintf(buf+len ,"AFE_TOP_CON0 = 0x%x\n",Ana_Get_Reg(ANA_AFE_TOP_CON0));
+
+    len += sprintf(buf+len ,"AFUNC_AUD_CON0 = 0x%x\n",Ana_Get_Reg(AFUNC_AUD_CON0));
+    len += sprintf(buf+len ,"AFUNC_AUD_CON1 = 0x%x\n",Ana_Get_Reg(AFUNC_AUD_CON1));
+    len += sprintf(buf+len ,"AFUNC_AUD_CON2 = 0x%x\n",Ana_Get_Reg(AFUNC_AUD_CON2));
+    len += sprintf(buf+len ,"AFUNC_AUD_CON3 = 0x%x\n",Ana_Get_Reg(AFUNC_AUD_CON3));
+    len += sprintf(buf+len ,"AFUNC_AUD_CON4 = 0x%x\n",Ana_Get_Reg(AFUNC_AUD_CON4));
+
+    len += sprintf(buf+len ,"I2S_FIFO_MON0 = 0x%x\n",Ana_Get_Reg(AFE_I2S_FIFO_MON0));
+    len += sprintf(buf+len ,"I2S_FIFO_CFG0 = 0x%x\n",Ana_Get_Reg(AFE_I2S_FIFO_CFG0));
+
+    len += sprintf(buf+len ,"TOP_CKPDN = 0x%x\n",Ana_Get_Reg(TOP_CKPDN));
+    len += sprintf(buf+len ,"TOP_CKPDN2 = 0x%x\n",Ana_Get_Reg(TOP_CKPDN2));
+    len += sprintf(buf+len ,"TOP_CKCON1 = 0x%x\n",Ana_Get_Reg(TOP_CKCON1));
+    len += sprintf(buf+len ,"SPK_CON0 = 0x%x\n",Ana_Get_Reg(SPK_CON0));
+    len += sprintf(buf+len ,"SPK_CON1 = 0x%x\n",Ana_Get_Reg(SPK_CON1));
+    len += sprintf(buf+len ,"SPK_CON2 = 0x%x\n",Ana_Get_Reg(SPK_CON2));
+    len += sprintf(buf+len ,"SPK_CON3 = 0x%x\n",Ana_Get_Reg(SPK_CON3));
+
+    len += sprintf(buf+len ,"SPK_CON4 = 0x%x\n",Ana_Get_Reg(SPK_CON4));
+    len += sprintf(buf+len ,"SPK_CON5 = 0x%x\n",Ana_Get_Reg(SPK_CON5));
+    len += sprintf(buf+len ,"SPK_CON6 = 0x%x\n",Ana_Get_Reg(SPK_CON6));
+    len += sprintf(buf+len ,"SPK_CON7 = 0x%x\n",Ana_Get_Reg(SPK_CON7));
+    len += sprintf(buf+len ,"SPK_CON8 = 0x%x\n",Ana_Get_Reg(SPK_CON8));
+
+    len += sprintf(buf+len ,"SPK_CON9 = 0x%x\n",Ana_Get_Reg(SPK_CON9));
+    len += sprintf(buf+len ,"SPK_CON10 = 0x%x\n",Ana_Get_Reg(SPK_CON10));
+    len += sprintf(buf+len ,"SPK_CON11 = 0x%x\n",Ana_Get_Reg(SPK_CON11));
+
+    len += sprintf(buf+len ,"AUDDAC_CON0 = 0x%x\n",Ana_Get_Reg(AUDDAC_CON0));
+    len += sprintf(buf+len ,"AUDBUF_CFG0 = 0x%x\n",Ana_Get_Reg(AUDBUF_CFG0));
+    len += sprintf(buf+len ,"AUDBUF_CFG1 = 0x%x\n",Ana_Get_Reg(AUDBUF_CFG1));
+    len += sprintf(buf+len ,"AUDBUF_CFG2 = 0x%x\n",Ana_Get_Reg(AUDBUF_CFG2));
+    len += sprintf(buf+len ,"AUDBUF_CFG3 = 0x%x\n",Ana_Get_Reg(AUDBUF_CFG3));
+    len += sprintf(buf+len ,"AUDBUF_CFG4 = 0x%x\n",Ana_Get_Reg(AUDBUF_CFG4));
+
+    len += sprintf(buf+len ,"IBIASDIST_CFG0 = 0x%x\n",Ana_Get_Reg(IBIASDIST_CFG0));
+    len += sprintf(buf+len ,"AUDACCDEPOP_CFG0 = 0x%x\n",Ana_Get_Reg(AUDACCDEPOP_CFG0));
+    len += sprintf(buf+len ,"AUD_IV_CFG0 = 0x%x\n",Ana_Get_Reg(AUD_IV_CFG0));
+    len += sprintf(buf+len ,"AUDCLKGEN_CFG0 = 0x%x\n",Ana_Get_Reg(AUDCLKGEN_CFG0));
+    len += sprintf(buf+len ,"AUDLDO_CFG0 = 0x%x\n",Ana_Get_Reg(AUDLDO_CFG0));
+    len += sprintf(buf+len ,"AUDLDO_CFG1 = 0x%x\n",Ana_Get_Reg(AUDLDO_CFG1));
+    len += sprintf(buf+len ,"AUDNVREGGLB_CFG0 = 0x%x\n",Ana_Get_Reg(AUDNVREGGLB_CFG0));
+    len += sprintf(buf+len ,"AUD_NCP0 = 0x%x\n",Ana_Get_Reg(AUD_NCP0));
+    len += sprintf(buf+len ,"AUDPREAMP_CON0 = 0x%x\n",Ana_Get_Reg(AUDPREAMP_CON0));
+    len += sprintf(buf+len ,"AUDADC_CON0 = 0x%x\n",Ana_Get_Reg(AUDADC_CON0));
+    len += sprintf(buf+len ,"AUDADC_CON1 = 0x%x\n",Ana_Get_Reg(AUDADC_CON1));
+    len += sprintf(buf+len ,"AUDADC_CON2 = 0x%x\n",Ana_Get_Reg(AUDADC_CON2));
+    len += sprintf(buf+len ,"AUDADC_CON3 = 0x%x\n",Ana_Get_Reg(AUDADC_CON3));
+    len += sprintf(buf+len ,"AUDADC_CON4 = 0x%x\n",Ana_Get_Reg(AUDADC_CON4));
+    len += sprintf(buf+len ,"AUDADC_CON5 = 0x%x\n",Ana_Get_Reg(AUDADC_CON5));
+    len += sprintf(buf+len ,"AUDADC_CON6 = 0x%x\n",Ana_Get_Reg(AUDADC_CON6));
+    len += sprintf(buf+len ,"AUDDIGMI_CON0 = 0x%x\n",Ana_Get_Reg(AUDDIGMI_CON0));
+    len += sprintf(buf+len ,"AUDLSBUF_CON0 = 0x%x\n",Ana_Get_Reg(AUDLSBUF_CON0));
+    len += sprintf(buf+len ,"AUDLSBUF_CON1 = 0x%x\n",Ana_Get_Reg(AUDLSBUF_CON1));
+    len += sprintf(buf+len ,"AUDENCSPARE_CON0 = 0x%x\n",Ana_Get_Reg(AUDENCSPARE_CON0));
+    len += sprintf(buf+len ,"AUDENCCLKSQ_CON0 = 0x%x\n",Ana_Get_Reg(AUDENCCLKSQ_CON0));
+    len += sprintf(buf+len ,"AUDPREAMPGAIN_CON0 = 0x%x\n",Ana_Get_Reg(AUDPREAMPGAIN_CON0));
+    len += sprintf(buf+len ,"ZCD_CON0 = 0x%x\n",Ana_Get_Reg(ZCD_CON0));
+    len += sprintf(buf+len ,"ZCD_CON1 = 0x%x\n",Ana_Get_Reg(ZCD_CON1));
+    len += sprintf(buf+len ,"ZCD_CON2 = 0x%x\n",Ana_Get_Reg(ZCD_CON2));
+    len += sprintf(buf+len ,"ZCD_CON3 = 0x%x\n",Ana_Get_Reg(ZCD_CON3));
+    len += sprintf(buf+len ,"ZCD_CON4 = 0x%x\n",Ana_Get_Reg(ZCD_CON4));
+    len += sprintf(buf+len ,"ZCD_CON5 = 0x%x\n",Ana_Get_Reg(ZCD_CON5));
+    len += sprintf(buf+len ,"NCP_CLKDIV_CON0 = 0x%x\n",Ana_Get_Reg(NCP_CLKDIV_CON0));
+    len += sprintf(buf+len ,"NCP_CLKDIV_CON1 = 0x%x\n",Ana_Get_Reg(NCP_CLKDIV_CON1));
+
+    PRINTK_AUDDRV("AudDrv_Read_Procmem len = %d\n",len);
+
+    AudDrv_Clk_Off();
+    PRINTK_AUDDRV("-AudDrv_Read_Procmem \n");
+    return len;
+}
+
+void Auddrv_Handle_Mem_context(AFE_MEM_CONTROL_T *Mem_Block)
+{
+    kal_uint32 HW_Cur_ReadIdx = 0;
+    kal_int32 Hw_Get_bytes = 0;
+    AFE_BLOCK_T  *mBlock = NULL;
+
+    if(Mem_Block == NULL)
+        return;
+
+    switch(Mem_Block->MemIfNum)
+    {
+        case MEM_VUL:
+            HW_Cur_ReadIdx =Afe_Get_Reg(AFE_VUL_CUR);
+            break;
+        case MEM_DAI:
+            HW_Cur_ReadIdx =Afe_Get_Reg(AFE_DAI_CUR);
+            break;
+        case MEM_AWB:
+            HW_Cur_ReadIdx =Afe_Get_Reg(AFE_AWB_CUR);
+            break;
+        case MEM_MOD_DAI:
+            HW_Cur_ReadIdx =Afe_Get_Reg(AFE_MOD_PCM_CUR);
+            break;
+    }
+    mBlock = &Mem_Block->rBlock;
+
+    if(CheckSize (HW_Cur_ReadIdx))
+        return;
+    if(mBlock->pucVirtBufAddr  == NULL)
+        return;
+
+    // HW already fill in
+    Hw_Get_bytes = (HW_Cur_ReadIdx - mBlock->pucPhysBufAddr) - mBlock->u4WriteIdx;
+    if(Hw_Get_bytes <0){
+        Hw_Get_bytes += mBlock->u4BufferSize;
+    }
+
+    /*
+    PRINTK_AUDDRV("Auddrv_Handle_Mem_context Hw_Get_bytes:%x, HW_Cur_ReadIdx:%x, u4DMAReadIdx:%x, u4WriteIdx:0x%x, pucPhysBufAddr:%x Mem_Block->MemIfNum = %d \n",
+      Hw_Get_bytes,HW_Cur_ReadIdx,mBlock->u4DMAReadIdx,mBlock->u4WriteIdx,mBlock->pucPhysBufAddr,Mem_Block->MemIfNum);*/
+
+    mBlock->u4WriteIdx  += Hw_Get_bytes;
+    mBlock->u4WriteIdx  %= mBlock->u4BufferSize;
+    mBlock->u4DataRemained += Hw_Get_bytes;
+
+   // buffer overflow
+    if(mBlock->u4DataRemained > mBlock->u4BufferSize)
+    {
+      PRINTK_AUDDRV("Auddrv_Handle_Mem_context buffer overflow u4DMAReadIdx:%x, u4WriteIdx:%x, u4DataRemained:%x, u4BufferSize:%x \n",
+      mBlock->u4DMAReadIdx,mBlock->u4WriteIdx,mBlock->u4DataRemained, mBlock->u4BufferSize);
+      mBlock->u4DataRemained= mBlock->u4BufferSize/2;
+      mBlock->u4DMAReadIdx = mBlock->u4WriteIdx - mBlock->u4BufferSize/2;
+      if( mBlock->u4DMAReadIdx <0){
+          mBlock->u4DMAReadIdx+=mBlock->u4BufferSize;
+      }
+   }
+
+   switch(Mem_Block->MemIfNum)
+   {
+       case MEM_VUL:
+           VUL_wait_queue_flag =1;
+           wake_up_interruptible(&VUL_Wait_Queue);
+           break;
+       case MEM_DAI:
+           DAI_wait_queue_flag =1;
+           wake_up_interruptible(&DAI_Wait_Queue);
+           break;
+       case MEM_AWB:
+           AWB_wait_queue_flag =1;
+           wake_up_interruptible(&AWB_Wait_Queue);
+           break;
+       case MEM_MOD_DAI:
+           MODDAI_wait_queue_flag =1;
+           wake_up_interruptible(&MODDAI_Wait_Queue);
+           break;
+       default:
+           break;
+   }
+}
+
+
+
+void Auddrv_UL_Interrupt_Handler(void)  // irq2 ISR handler
+{
+    unsigned long flags;
+    kal_uint32 Afe_Dac_Con0 = Afe_Get_Reg(AFE_DAC_CON0);
+    AFE_MEM_CONTROL_T *Mem_Block = NULL;
+    spin_lock_irqsave(&auddrv_irqstatus_lock, flags);
+    if(Afe_Dac_Con0&0x8)
+    {
+        // handle VUL Context
+        Mem_Block =&VUL_Control_context;
+        Auddrv_Handle_Mem_context(Mem_Block);
+    }
+    if(Afe_Dac_Con0&0x10)
+    {
+        //handle DAI Context
+        Mem_Block = &DAI_Control_context;
+        Auddrv_Handle_Mem_context(Mem_Block);
+    }
+    if(Afe_Dac_Con0&0x40)
+    {
+        // handle AWB Context
+        Mem_Block = &AWB_Control_context;
+        Auddrv_Handle_Mem_context(Mem_Block);
+    }
+    if(Afe_Dac_Con0&0x80)
+    {
+        // handle MODDAI context
+        Mem_Block = &MODDAI_Control_context;
+        Auddrv_Handle_Mem_context(Mem_Block);
+    }
+    spin_unlock_irqrestore(&auddrv_irqstatus_lock, flags);
+}
+
+void Auddrv_DL_Interrupt_Handler(void)  // irq1 ISR handler
+{
+    unsigned long flags;
+    bool overflowflag = false;
+    kal_int32 Afe_consumed_bytes = 0;
+    kal_int32 HW_memory_index =0;
+    kal_int32 HW_Cur_ReadIdx = 0;
+    AFE_BLOCK_T *Afe_Block = &(AFE_dL1_Control_context.rBlock);
+    //spin lock with interrupt disable
+    spin_lock_irqsave(&auddrv_irqstatus_lock, flags);
+
+    HW_Cur_ReadIdx = Afe_Get_Reg(AFE_DL1_CUR);
+    if(HW_Cur_ReadIdx == 0)
+    {
+        PRINTK_AUDDRV("[Auddrv] HW_Cur_ReadIdx ==0 \n");
+        HW_Cur_ReadIdx = Afe_Block->pucPhysBufAddr;
+    }
+    HW_memory_index =  (HW_Cur_ReadIdx - Afe_Block->pucPhysBufAddr);
+    /*
+    PRINTK_AUDDRV("[Auddrv] HW_Cur_ReadIdx=0x%x HW_memory_index = 0x%x Afe_Block->pucPhysBufAddr = 0x%x\n",
+        HW_Cur_ReadIdx,HW_memory_index,Afe_Block->pucPhysBufAddr);*/
+
+    // get hw consume bytes
+    if(HW_memory_index > Afe_Block->u4DMAReadIdx)
+    {
+        Afe_consumed_bytes = HW_memory_index-Afe_Block->u4DMAReadIdx;
+    }
+    else
+    {
+        Afe_consumed_bytes = Afe_Block->u4BufferSize+ HW_memory_index - Afe_Block->u4DMAReadIdx ;
+    }
+
+    if((Afe_consumed_bytes & 0x1f) != 0 ){
+        PRINTK_AUDDRV("[Auddrv] DMA address is not aligned 32 bytes \n");
+     }
+     /*
+     PRINTK_AUDDRV("+Auddrv_DL_Interrupt_Handler ReadIdx:%x WriteIdx:%x, DataRemained:%x, Afe_consumed_bytes:%x HW_memory_index = %x \n",
+         Afe_Block->u4DMAReadIdx,Afe_Block->u4WriteIdx,Afe_Block->u4DataRemained,Afe_consumed_bytes,HW_memory_index);
+         */
+
+     if(Afe_Block->u4DataRemained < Afe_consumed_bytes || Afe_Block->u4DataRemained <= 0 ||Afe_Block->u4DataRemained  > Afe_Block->u4BufferSize || AudIrqReset)
+     {
+         // buffer underflow --> clear  whole buffer
+         memset(Afe_Block->pucVirtBufAddr,0,Afe_Block->u4BufferSize);
+         PRINTK_AUDDRV("+DL_Handling underflow ReadIdx:%x WriteIdx:%x, DataRemained:%x, Afe_consumed_bytes:%x HW_memory_index = 0x%x\n",
+             Afe_Block->u4DMAReadIdx,Afe_Block->u4WriteIdx,Afe_Block->u4DataRemained,Afe_consumed_bytes,HW_memory_index);
+         Afe_Block->u4DMAReadIdx  = HW_memory_index;
+         Afe_Block->u4WriteIdx  = Afe_Block->u4DMAReadIdx;
+         Afe_Block->u4DataRemained = Afe_Block->u4BufferSize;
+         PRINTK_AUDDRV("-DL_Handling underflow ReadIdx:%x WriteIdx:%x, DataRemained:%x, Afe_consumed_bytes %x \n",
+             Afe_Block->u4DMAReadIdx,Afe_Block->u4WriteIdx,Afe_Block->u4DataRemained,Afe_consumed_bytes);
+         AudIrqReset = false;
+         overflowflag = true;
+     }
+     else
+     {
+         /*
+         PRINTK_AUDDRV("+DL_Handling normal ReadIdx:%x ,DataRemained:%x, WriteIdx:%x \n",
+             Afe_Block->u4DMAReadIdx,Afe_Block->u4DataRemained,Afe_Block->u4WriteIdx);*/
+         Afe_Block->u4DataRemained -= Afe_consumed_bytes;
+         Afe_Block->u4DMAReadIdx += Afe_consumed_bytes;
+         Afe_Block->u4DMAReadIdx %= Afe_Block->u4BufferSize;
+         /*
+         PRINTK_AUDDRV("-DL_Handling normal ReadIdx:%x ,DataRemained:%x, WriteIdx:%x \n",
+             Afe_Block->u4DMAReadIdx,Afe_Block->u4DataRemained,Afe_Block->u4WriteIdx);*/
+     }
+
+    // wait up write thread
+    DL1_wait_queue_flag =1;
+    wake_up_interruptible(&DL1_Wait_Queue);
+    spin_unlock_irqrestore(&auddrv_irqstatus_lock, flags);
+    if(overflowflag == true)
+    {
+        kill_fasync(&AudDrv_async, SIGIO, POLL_IN); // notify the user space
+    }
+}
+
+static unsigned long long Irq_time_t1 =0, Irq_time_t2 =0;
+static void CheckInterruptTiming(void)
+{
+    if(Irq_time_t1 == 0)
+    {
+       Irq_time_t1 = sched_clock(); // in ns (10^9)
+    }
+    else
+    {
+        Irq_time_t2 =Irq_time_t1;
+        Irq_time_t1 = sched_clock(); // in ns (10^9)
+        if((Irq_time_t1 > Irq_time_t2) && DL1_Interrupt_Interval_Limit )
+        {
+            /*
+            PRINTK_AUDDRV("CheckInterruptTiming  Irq_time_t2 t2 = %llu Irq_time_t1 = %llu Irq_time_t1 - Irq_time_t2 = %llu  DL1_Interrupt_Interval_Limit = %d\n",
+                Irq_time_t2,Irq_time_t1, Irq_time_t1 - Irq_time_t2,DL1_Interrupt_Interval_Limit);*/
+            Irq_time_t2 = Irq_time_t1 - Irq_time_t2;
+            if(Irq_time_t2 > DL1_Interrupt_Interval_Limit*1000000)
+            {
+                PRINTK_AUDDRV("CheckInterruptTiming interrupt may be blocked Irq_time_t2 = llu DL1_Interrupt_Interval_Limit = %d\n",
+                    Irq_time_t2,DL1_Interrupt_Interval_Limit);
+            }
+        }
+    }
+}
+
+static void ClearInterruptTiming(void)
+{
+    Irq_time_t1 = 0;
+    Irq_time_t2 = 0;
+}
+
+
+static irqreturn_t AudDrv_IRQ_handler(int irq, void *dev_id)
+{
+    kal_uint32 volatile u4RegValue;
+    u4RegValue = Afe_Get_Reg (AFE_IRQ_STATUS);
+    u4RegValue &= 0xf;
+    //PRINTK_AUDDRV("AudDrv_IRQ_handler AFE_IRQ_MCU_STATUS = %x \n",u4RegValue);
+
+    // here is error handle , for interrupt is trigger but not status , clear all interrupt with bit 6
+    if(u4RegValue ==0 ){
+        PRINTK_AUDDRV("u4RegValue == 0 \n");
+        AudioWayDisable();
+        AudDrv_Clk_On();
+        Afe_Set_Reg (AFE_IRQ_CLR, 1<<6 ,0xff);
+        Afe_Set_Reg (AFE_IRQ_CLR, 1 ,0xff);
+        Afe_Set_Reg (AFE_IRQ_CLR, 1<<1 ,0xff);
+        Afe_Set_Reg (AFE_IRQ_CLR, 1<<2 ,0xff);
+        Afe_Set_Reg (AFE_IRQ_CLR, 1<<3 ,0xff);
+        Afe_Set_Reg (AFE_IRQ_CLR, 1<<4 ,0xff);
+        Afe_Set_Reg (AFE_IRQ_CLR, 1<<5 ,0xff);
+
+        AudDrv_Clk_Off();
+        goto AudDrv_IRQ_handler_exit;
+    }
+    CheckInterruptTiming();
+
+    if(u4RegValue&INTERRUPT_IRQ1_MCU)
+    {
+        Auddrv_DL_Interrupt_Handler();
+    }
+    if(u4RegValue&INTERRUPT_IRQ2_MCU)
+    {
+        Auddrv_UL_Interrupt_Handler();
+    }
+    if(u4RegValue&INTERRUPT_IRQ_MCU_DAI_SET)
+    {
+
+    }
+    if(u4RegValue&INTERRUPT_IRQ_MCU_DAI_RST)
+    {
+
+    }
+
+    // clear irq
+    Afe_Set_Reg (AFE_IRQ_CLR, u4RegValue ,0xff);
+
+AudDrv_IRQ_handler_exit:
+   return IRQ_HANDLED;
+}
+
+
+static int AudDrv_probe(struct platform_device *dev)
+{
+   int ret = 0;
+   PRINTK_AUDDRV("+AudDrv_probe \n");
+
+   PRINTK_AUDDRV("+request_irq \n");
+   ret = request_irq(MT6583_AFE_MCU_IRQ_LINE, AudDrv_IRQ_handler,IRQF_TRIGGER_LOW/*IRQF_TRIGGER_FALLING*/, "Afe_ISR_Handle", dev);
+   if(ret < 0 ){
+       PRINTK_AUDDRV("AudDrv_probe request_irq Fail \n");
+   }
+
+   // init
+   memset((void*)&AFE_dL1_Control_context,0,sizeof(AFE_MEM_CONTROL_T));
+   memset((void*)&AFE_dL2_Control_context,0,sizeof(AFE_MEM_CONTROL_T));
+   memset((void*)&AWB_Control_context,0,sizeof(AFE_MEM_CONTROL_T));
+   memset((void*)&VUL_Control_context,0,sizeof(AFE_MEM_CONTROL_T));
+   memset((void*)&DAI_Control_context,0,sizeof(AFE_MEM_CONTROL_T));
+   memset((void*)&MODDAI_Control_context,0,sizeof(AFE_MEM_CONTROL_T));
+   memset((void*)&Suspend_reg,0,sizeof(AudAfe_Suspend_Reg));
+   memset((void*)&SPH_Ctrl_State,0,sizeof(SPH_Control));
+   AFE_dL1_Control_context.MemIfNum =MEM_DL1 ;
+   AFE_dL2_Control_context.MemIfNum =MEM_DL2 ;
+   AWB_Control_context.MemIfNum =MEM_AWB ;
+   VUL_Control_context.MemIfNum =MEM_VUL ;
+   DAI_Control_context.MemIfNum =MEM_DAI ;
+   MODDAI_Control_context.MemIfNum =MEM_MOD_DAI ;
+   memset((void*)&SPH_Ctrl_State,0,sizeof(SPH_Control));
+
+   #ifdef AUDIO_MEMORY_SRAM
+   AFE_SRAM_ADDRESS =ioremap_nocache(AFE_INTERNAL_SRAM_PHY_BASE,0x10000);
+   PRINTK_AUDDRV("AFE_BASE_ADDRESS = %p AFE_SRAM_ADDRESS = %p\n",AFE_BASE_ADDRESS,AFE_SRAM_ADDRESS);
+   #endif
+
+   #ifdef AUDIO_MEM_IOREMAP
+   AFE_BASE_ADDRESS =ioremap_nocache(AUDIO_HW_PHYSICAL_BASE,0x10000);
+   #endif
+
+   PRINTK_AUDDRV("-AudDrv_probe \n");
+   Speaker_Init();
+   if(Auddrv_First_bootup == true)
+   {
+       power_init();
+   }
+   else
+   {
+
+   }
+   return 0;
+}
+
+static void AudDrv_Store_reg_AFE(void)
+{
+   AudDrv_Clk_On();
+
+  //Suspend_reg.Suspend_AUDIO_TOP_CON0=            Afe_Get_Reg(AUDIO_AFE_TOP_CON0);
+  Suspend_reg.Suspend_AUDIO_TOP_CON3=            Afe_Get_Reg(AUDIO_AFE_TOP_CON3);
+  Suspend_reg.Suspend_AFE_DAC_CON0=              Afe_Get_Reg(AFE_DAC_CON0);
+  Suspend_reg.Suspend_AFE_DAC_CON1=              Afe_Get_Reg(AFE_DAC_CON1);
+  Suspend_reg.Suspend_AFE_I2S_CON=               Afe_Get_Reg(AFE_I2S_CON);
+  Suspend_reg.Suspend_AFE_DAIBT_CON0=            Afe_Get_Reg(AFE_DAIBT_CON0);
+
+  Suspend_reg.Suspend_AFE_CONN0=                 Afe_Get_Reg(AFE_CONN0);
+  Suspend_reg.Suspend_AFE_CONN1=                 Afe_Get_Reg(AFE_CONN1);
+  Suspend_reg.Suspend_AFE_CONN2=                 Afe_Get_Reg(AFE_CONN2);
+  Suspend_reg.Suspend_AFE_CONN3=                 Afe_Get_Reg(AFE_CONN3);
+  Suspend_reg.Suspend_AFE_CONN4=                 Afe_Get_Reg(AFE_CONN4);
+
+  Suspend_reg.Suspend_AFE_I2S_CON1=              Afe_Get_Reg(AFE_I2S_CON1);
+  Suspend_reg.Suspend_AFE_I2S_CON2=              Afe_Get_Reg(AFE_I2S_CON2);
+  Suspend_reg.Suspend_AFE_MRGIF_CON=             Afe_Get_Reg(AFE_MRGIF_CON);
+
+  Suspend_reg.Suspend_AFE_DL1_BASE=              Afe_Get_Reg(AFE_DL1_BASE);
+  Suspend_reg.Suspend_AFE_DL1_CUR=               Afe_Get_Reg(AFE_DL1_CUR);
+  Suspend_reg.Suspend_AFE_DL1_END=               Afe_Get_Reg(AFE_DL1_END);
+  Suspend_reg.Suspend_AFE_DL2_BASE=              Afe_Get_Reg(AFE_DL2_BASE);
+  Suspend_reg.Suspend_AFE_DL2_CUR=               Afe_Get_Reg(AFE_DL2_CUR);
+  Suspend_reg.Suspend_AFE_DL2_END=               Afe_Get_Reg(AFE_DL2_END);
+  Suspend_reg.Suspend_AFE_AWB_BASE=              Afe_Get_Reg(AFE_AWB_BASE);
+  Suspend_reg.Suspend_AFE_AWB_CUR=               Afe_Get_Reg(AFE_AWB_CUR);
+  Suspend_reg.Suspend_AFE_AWB_END=               Afe_Get_Reg(AFE_AWB_END);
+  Suspend_reg.Suspend_AFE_VUL_BASE=              Afe_Get_Reg(AFE_VUL_BASE);
+  Suspend_reg.Suspend_AFE_VUL_CUR=               Afe_Get_Reg(AFE_VUL_CUR);
+  Suspend_reg.Suspend_AFE_VUL_END=               Afe_Get_Reg(AFE_VUL_END);
+  Suspend_reg.Suspend_AFE_DAI_BASE=              Afe_Get_Reg(AFE_DAI_BASE);
+  Suspend_reg.Suspend_AFE_DAI_CUR=               Afe_Get_Reg(AFE_DAI_CUR);
+  Suspend_reg.Suspend_AFE_DAI_END=               Afe_Get_Reg(AFE_DAI_END);
+
+  Suspend_reg.Suspend_AFE_IRQ_CON=               Afe_Get_Reg(AFE_IRQ_CON);
+  Suspend_reg.Suspend_AFE_MEMIF_MON0=            Afe_Get_Reg(AFE_MEMIF_MON0);
+  Suspend_reg.Suspend_AFE_MEMIF_MON1=            Afe_Get_Reg(AFE_MEMIF_MON1);
+  Suspend_reg.Suspend_AFE_MEMIF_MON2=            Afe_Get_Reg(AFE_MEMIF_MON2);
+  Suspend_reg.Suspend_AFE_MEMIF_MON3=            Afe_Get_Reg(AFE_MEMIF_MON3);
+  Suspend_reg.Suspend_AFE_MEMIF_MON4=            Afe_Get_Reg(AFE_MEMIF_MON4);
+
+  Suspend_reg.Suspend_AFE_FOC_CON=               Afe_Get_Reg(AFE_FOC_CON);
+  Suspend_reg.Suspend_AFE_FOC_CON1=              Afe_Get_Reg(AFE_FOC_CON1);
+  Suspend_reg.Suspend_AFE_FOC_CON2=              Afe_Get_Reg(AFE_FOC_CON2);
+  Suspend_reg.Suspend_AFE_FOC_CON3=              Afe_Get_Reg(AFE_FOC_CON3);
+  Suspend_reg.Suspend_AFE_FOC_CON4=              Afe_Get_Reg(AFE_FOC_CON4);
+  Suspend_reg.Suspend_AFE_FOC_CON5=              Afe_Get_Reg(AFE_FOC_CON5);
+
+  Suspend_reg.Suspend_AFE_MON_STEP=              Afe_Get_Reg(AFE_MON_STEP);
+  Suspend_reg.Suspend_AFE_SIDETONE_DEBUG=       Afe_Get_Reg(AFE_SIDETONE_DEBUG);
+  Suspend_reg.Suspend_AFE_SIDETONE_MON=         Afe_Get_Reg(AFE_SIDETONE_MON);
+  Suspend_reg.Suspend_AFE_SIDETONE_CON0=        Afe_Get_Reg(AFE_SIDETONE_CON0);
+  Suspend_reg.Suspend_AFE_SIDETONE_COEFF=       Afe_Get_Reg(AFE_SIDETONE_COEFF);
+  Suspend_reg.Suspend_AFE_SIDETONE_CON1=        Afe_Get_Reg(AFE_SIDETONE_CON1);
+  Suspend_reg.Suspend_AFE_SIDETONE_GAIN=        Afe_Get_Reg(AFE_SIDETONE_GAIN);
+  Suspend_reg.Suspend_AFE_SGEN_CON0=             Afe_Get_Reg(AFE_SGEN_CON0);
+
+  Suspend_reg.Suspend_AFE_PREDIS_CON0=           Afe_Get_Reg(AFE_PREDIS_CON0);
+  Suspend_reg.Suspend_AFE_PREDIS_CON1=           Afe_Get_Reg(AFE_PREDIS_CON1);
+  Suspend_reg.Suspend_AFE_MRG_MON0=              Afe_Get_Reg(AFE_MRG_MON0);
+  Suspend_reg.Suspend_AFE_MRG_MON1=              Afe_Get_Reg(AFE_MRG_MON1);
+  Suspend_reg.Suspend_AFE_MRG_MON2=              Afe_Get_Reg(AFE_MRG_MON2);
+
+  Suspend_reg.Suspend_AFE_MOD_PCM_BASE=          Afe_Get_Reg(AFE_MOD_PCM_BASE);
+  Suspend_reg.Suspend_AFE_MOD_PCM_END=           Afe_Get_Reg(AFE_MOD_PCM_END);
+  Suspend_reg.Suspend_AFE_MOD_PCM_CUR=           Afe_Get_Reg(AFE_MOD_PCM_CUR);
+  Suspend_reg.Suspend_AFE_IRQ_MCU_CON=           Afe_Get_Reg(AFE_IRQ_MCU_CON);
+  Suspend_reg.Suspend_AFE_IRQ_MCU_STATUS=        Afe_Get_Reg(AFE_IRQ_STATUS);
+  Suspend_reg.Suspend_AFE_IRQ_CLR=               Afe_Get_Reg(AFE_IRQ_CLR);
+  Suspend_reg.Suspend_AFE_IRQ_MCU_CNT1=          Afe_Get_Reg(AFE_IRQ_CNT1);
+  Suspend_reg.Suspend_AFE_IRQ_MCU_CNT2=          Afe_Get_Reg(AFE_IRQ_CNT2);
+  Suspend_reg.Suspend_AFE_IRQ_MCU_MON2=          Afe_Get_Reg(AFE_IRQ_MON2);
+  Suspend_reg.Suspend_AFE_IRQ_MCU_CNT5=          Afe_Get_Reg(AFE_IRQ_CNT5);
+  Suspend_reg.Suspend_AFE_IRQ1_MCN_CNT_MON=      Afe_Get_Reg(AFE_IRQ1_CNT_MON);
+  Suspend_reg.Suspend_AFE_IRQ2_MCN_CNT_MON=      Afe_Get_Reg(AFE_IRQ2_CNT_MON);
+  Suspend_reg.Suspend_AFE_IRQ1_MCU_EN_CNT_MON;   Afe_Get_Reg(AFE_IRQ1_EN_CNT_MON);
+  Suspend_reg.Suspend_AFE_IRQ5_MCU_EN_CNT_MON;   Afe_Get_Reg(AFE_IRQ5_MCU_EN_CNT_MON);
+  Suspend_reg.Suspend_AFE_MEMIF_MINLEN=          Afe_Get_Reg(AFE_MEMIF_MINLEN);
+  Suspend_reg.Suspend_AFE_MEMIF_MAXLEN=          Afe_Get_Reg(AFE_MEMIF_MAXLEN);
+  Suspend_reg.Suspend_AFE_MEMIF_PBUF_SIZE=       Afe_Get_Reg(AFE_IEC_PREFETCH_SIZE);
+
+  Suspend_reg.Suspend_AFE_GAIN1_CON0=            Afe_Get_Reg(AFE_GAIN1_CON0);
+  Suspend_reg.Suspend_AFE_GAIN1_CON1=            Afe_Get_Reg(AFE_GAIN1_CON1);
+  Suspend_reg.Suspend_AFE_GAIN1_CON2=            Afe_Get_Reg(AFE_GAIN1_CON2);
+  Suspend_reg.Suspend_AFE_GAIN1_CON3=            Afe_Get_Reg(AFE_GAIN1_CON3);
+  Suspend_reg.Suspend_AFE_GAIN1_CONN=            Afe_Get_Reg(AFE_GAIN1_CONN);
+  Suspend_reg.Suspend_AFE_GAIN1_CUR=             Afe_Get_Reg(AFE_GAIN1_CUR);
+  Suspend_reg.Suspend_AFE_GAIN2_CON0=            Afe_Get_Reg(AFE_GAIN2_CON0);
+  Suspend_reg.Suspend_AFE_GAIN2_CON1=            Afe_Get_Reg(AFE_GAIN2_CON1);
+  Suspend_reg.Suspend_AFE_GAIN2_CON2=            Afe_Get_Reg(AFE_GAIN2_CON2);
+  Suspend_reg.Suspend_AFE_GAIN2_CON3=            Afe_Get_Reg(AFE_GAIN2_CON3);
+  Suspend_reg.Suspend_AFE_GAIN2_CONN=            Afe_Get_Reg(AFE_GAIN2_CONN);
+
+  #if 0
+  Suspend_reg.Suspend_DBG_MON0=                  Afe_Get_Reg(DBG_MON0);
+  Suspend_reg.Suspend_DBG_MON1=                  Afe_Get_Reg(DBG_MON1);
+  Suspend_reg.Suspend_DBG_MON2=                  Afe_Get_Reg(DBG_MON2);
+  Suspend_reg.Suspend_DBG_MON3=                  Afe_Get_Reg(DBG_MON3);
+  Suspend_reg.Suspend_DBG_MON4=                  Afe_Get_Reg(DBG_MON4);
+  Suspend_reg.Suspend_DBG_MON5=                  Afe_Get_Reg(DBG_MON5);
+  Suspend_reg.Suspend_DBG_MON6=                  Afe_Get_Reg(DBG_MON6);
+  #endif
+  Suspend_reg.Suspend_AFE_ASRC_CON0=             Afe_Get_Reg(AFE_ASRC_CON0);
+  Suspend_reg.Suspend_AFE_ASRC_CON1=             Afe_Get_Reg(AFE_ASRC_CON1);
+  Suspend_reg.Suspend_AFE_ASRC_CON2=             Afe_Get_Reg(AFE_ASRC_CON2);
+  Suspend_reg.Suspend_AFE_ASRC_CON3=             Afe_Get_Reg(AFE_ASRC_CON3);
+  Suspend_reg.Suspend_AFE_ASRC_CON4=             Afe_Get_Reg(AFE_ASRC_CON4);
+  Suspend_reg.Suspend_AFE_ASRC_CON6=             Afe_Get_Reg(AFE_ASRC_CON6);
+  Suspend_reg.Suspend_AFE_ASRC_CON7=             Afe_Get_Reg(AFE_ASRC_CON7);
+  Suspend_reg.Suspend_AFE_ASRC_CON8=             Afe_Get_Reg(AFE_ASRC_CON8);
+  Suspend_reg.Suspend_AFE_ASRC_CON9=             Afe_Get_Reg(AFE_ASRC_CON9);
+  Suspend_reg.Suspend_AFE_ASRC_CON10=            Afe_Get_Reg(AFE_ASRC_CON10);
+  Suspend_reg.Suspend_AFE_ASRC_CON11=            Afe_Get_Reg(AFE_ASRC_CON11);
+  Suspend_reg.Suspend_PCM_INTF_CON1=             Afe_Get_Reg(PCM_INTF_CON1);
+  Suspend_reg.Suspend_PCM_INTF_CON2=             Afe_Get_Reg(PCM_INTF_CON2);
+  Suspend_reg.Suspend_PCM2_INTF_CON=              Afe_Get_Reg(PCM2_INTF_CON);
+
+  //spend_reg.Suspend_FOC_ROM_SIG=               Afe_Get_Reg(FOC_ROM_SIG);
+  AudDrv_Clk_Off();
+  PRINTK_AUDDRV("-AudDrv_Store_reg \n");
+}
+
+static void AudDrv_Recover_reg_AFE(void)
+{
+    AudDrv_Clk_On();
+    // Digital register setting
+    Afe_Set_Reg(AUDIO_AFE_TOP_CON3,          Suspend_reg.Suspend_AUDIO_TOP_CON3,         MASK_ALL);
+    Afe_Set_Reg(AFE_DAC_CON0,            Suspend_reg.Suspend_AFE_DAC_CON0,           MASK_ALL);
+    Afe_Set_Reg(AFE_DAC_CON1,            Suspend_reg.Suspend_AFE_DAC_CON1,           MASK_ALL);
+    Afe_Set_Reg(AFE_I2S_CON,             Suspend_reg.Suspend_AFE_I2S_CON,            MASK_ALL);
+    Afe_Set_Reg(AFE_DAIBT_CON0,          Suspend_reg.Suspend_AFE_DAIBT_CON0,         MASK_ALL);
+
+    Afe_Set_Reg(AFE_CONN0,               Suspend_reg.Suspend_AFE_CONN0,              MASK_ALL);
+    Afe_Set_Reg(AFE_CONN1,               Suspend_reg.Suspend_AFE_CONN1,              MASK_ALL);
+    Afe_Set_Reg(AFE_CONN2,               Suspend_reg.Suspend_AFE_CONN2,              MASK_ALL);
+    Afe_Set_Reg(AFE_CONN3,               Suspend_reg.Suspend_AFE_CONN3,              MASK_ALL);
+    Afe_Set_Reg(AFE_CONN4,               Suspend_reg.Suspend_AFE_CONN4,              MASK_ALL);
+
+    Afe_Set_Reg(AFE_I2S_CON1,            Suspend_reg.Suspend_AFE_I2S_CON1,           MASK_ALL

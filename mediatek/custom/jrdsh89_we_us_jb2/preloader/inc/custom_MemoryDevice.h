@@ -1,0 +1,16 @@
+
+
+#ifndef __CUSTOM_MEMORYDEVICE__
+#define __CUSTOM_MEMORYDEVICE__
+
+
+
+#define BOARD_ID                MT6589_EVB
+
+
+#define CS_PART_NUMBER[0]       KMK5U000VM_B309
+#define CS_PART_NUMBER[1]       MT29PZZZ8D4WKFEW_18W_6D4_mmd1
+#define CS_PART_NUMBER[2]       KMKJS000VM_B309
+#define CS_PART_NUMBER[3]       H9TP32A8JDMCPR_KGM
+
+#endif /* __CUSTOM_MEMORYDEVICE__ */
